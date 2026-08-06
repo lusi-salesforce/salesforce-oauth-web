@@ -1,0 +1,4 @@
+spring:
+  application:
+    name: salesforce-oauth-web
+  threads.virtual.enabled: true
