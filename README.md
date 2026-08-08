@@ -71,7 +71,7 @@ If a refresh token is expired, revoked, already rotated, or otherwise rejected, 
 
 ### Limit idle refresh-token TTL to 30 days
 
-Keeping **Limit Idle Refresh Token Time-to-Live (TTL) to 30 Days** enabled is a reasonable security setting. The policy shown in the screenshot—**Expire refresh token if not used for specific time: 30 days**—uses a sliding window. Each successful refresh resets the idle period.
+Keeping **Limit Idle Refresh Token Time-to-Live (TTL) to 30 Days** enabled is a reasonable security setting. The policy shown in the screenshot, **Expire refresh token if not used for specific time: 30 days**, uses a sliding window. Each successful refresh resets the idle period.
 
 The client refreshes only in response to a Salesforce API `401`; it does not run a background refresh timer. Therefore:
 
@@ -116,6 +116,16 @@ Despite the similar name, Salesforce's **Authorization Code and Credentials Flow
 
 The **Start Page** can remain `None`. Session timeout can remain at the organization default; when an access token expires and Salesforce returns `401`, the client uses its refresh token.
 
+## Token and heap-dump security
+
+Access and refresh tokens are held only in memory and are replaced when Salesforce rotates them. They are not persisted by this project. However, active tokens and immutable `String` objects that have not yet been garbage-collected can appear in a JVM heap dump.
+
+For a deployment where heap dumps are considered a credential-exposure risk:
+
+- Do not enable `-XX:+HeapDumpOnOutOfMemoryError`; automatic out-of-memory heap dumps are disabled by default.
+- Start the application with `-XX:+DisableAttachMechanism` if operational tooling such as `jcmd`, `jmap`, and `jstack` is not required. This prevents those tools from attaching to the JVM and requesting a heap dump.
+- Restrict operating-system access to the application process and treat any deliberately collected heap dump as a secret containing credentials.
+
 ## Relevant Salesforce documentation
 
 - [OAuth tokens and scopes](https://help.salesforce.com/s/articleView?id=sf.remoteaccess_oauth_tokens_scopes.htm&language=en_US&type=5)
@@ -124,3 +134,7 @@ The **Start Page** can remain `None`. Session timeout can remain at the organiza
 - [Configure External Client App OAuth settings](https://help.salesforce.com/s/articleView?id=sf.configure_external_client_app_oauth_settings.htm&language=en_US)
 - [Refresh-token IP allowlist](https://help.salesforce.com/s/articleView?id=xcloud.set_ip_allowlist_for_refresh_tokens.htm&language=en_US&type=5)
 - [Preauthorize users](https://help.salesforce.com/s/articleView?id=xcloud.preauth_user_app_access_through_eca.htm&language=en_US&type=5)
+
+Relevant Java documentation:
+
+- [Java 25 serviceability and heap-dump options](https://docs.oracle.com/en/java/javase/25/docs/specs/man/java.html)
