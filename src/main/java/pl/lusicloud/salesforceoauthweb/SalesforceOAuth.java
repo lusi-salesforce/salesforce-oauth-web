@@ -1,18 +1,14 @@
 package pl.lusicloud.salesforceoauthweb;
 
-import java.awt.*;
+import java.awt.Desktop;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
-import java.net.URLDecoder;
-import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.security.SecureRandom;
 import java.util.Base64;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 
@@ -20,21 +16,21 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
 import okhttp3.FormBody;
+import okhttp3.HttpUrl;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
-final class SalesforceOAuth {
+public final class SalesforceOAuth {
 
-  static final URI CALLBACK_URI = URI.create("http://localhost:8999/oauth/callback");
-  private static final SecureRandom RANDOM = new SecureRandom();
+  private static final HttpUrl CALLBACK_URL = HttpUrl.get("http://localhost:8999/oauth/callback");
 
   private SalesforceOAuth() {
   }
 
-  static OkHttpClient authenticate(String clientId, String salesforceDomain) {
+  public static OkHttpClient authenticate(String clientId, String salesforceDomain) {
     return authenticate(clientId, salesforceDomain, SalesforceOAuth::openBrowser);
   }
 
@@ -51,7 +47,7 @@ final class SalesforceOAuth {
   private static String authorize(
       AuthorizationAttempt attempt, Consumer<URI> authorizationPage) {
     try (var callbackServer = new LoopbackCallbackServer(attempt.state)) {
-      authorizationPage.accept(attempt.authorizationUri());
+      authorizationPage.accept(attempt.authorizationUrl().uri());
       return callbackServer.awaitAuthorizationCode();
     }
   }
@@ -65,7 +61,7 @@ final class SalesforceOAuth {
   }
 
   private static void openBrowser(URI authorizationUri) {
-    System.out.println("Open this URL to authenticate with Salesforce:\n" + authorizationUri);
+    System.out.println("Trying to open this URL in a browser to authenticate with Salesforce:\n" + authorizationUri);
     if (Desktop.isDesktopSupported()) {
       try {
         Desktop.getDesktop().browse(authorizationUri);
@@ -75,65 +71,65 @@ final class SalesforceOAuth {
     }
   }
 
-  private record ConnectedApp(String clientId, URI domain) {
+  private record ConnectedApp(String clientId, HttpUrl domain) {
 
-    static ConnectedApp from(String clientId, String domain) {
+    private static ConnectedApp from(String clientId, String domain) {
       var configuredDomain = required(domain, "salesforceDomain");
-      var origin = URI.create(configuredDomain.contains("://")
+      var origin = HttpUrl.get(configuredDomain.contains("://")
           ? configuredDomain
           : "https://" + configuredDomain);
-      var hasInvalidParts = origin.getHost() == null
-          || origin.getUserInfo() != null
-          || origin.getQuery() != null
-          || origin.getFragment() != null
-          || origin.getPath() != null && !origin.getPath().isBlank() && !"/".equals(origin.getPath());
+      var hasInvalidParts = !origin.username().isEmpty()
+          || !origin.password().isEmpty()
+          || origin.query() != null
+          || origin.fragment() != null
+          || !"/".equals(origin.encodedPath());
       if (hasInvalidParts) {
         throw new IllegalArgumentException("salesforceDomain must be a host name or origin URL");
       }
 
-      var isLocalHttp = "http".equalsIgnoreCase(origin.getScheme())
-          && ("localhost".equalsIgnoreCase(origin.getHost()) || "127.0.0.1".equals(origin.getHost()));
-      if (!"https".equalsIgnoreCase(origin.getScheme()) && !isLocalHttp) {
+      var isLocalHttp = "http".equals(origin.scheme())
+          && ("localhost".equals(origin.host()) || "127.0.0.1".equals(origin.host()));
+      if (!origin.isHttps() && !isLocalHttp) {
         throw new IllegalArgumentException("salesforceDomain must use HTTPS");
       }
 
-      var normalizedOrigin = URI.create(origin.getScheme() + "://" + origin.getRawAuthority());
-      return new ConnectedApp(required(clientId, "clientId"), normalizedOrigin);
+      return new ConnectedApp(required(clientId, "clientId"), origin);
     }
 
-    URI authorizationUri(String state, Pkce pkce) {
-      return URI.create(endpoint("/services/oauth2/authorize") + "?"
-          + "response_type=code"
-          + "&client_id=" + encode(clientId)
-          + "&redirect_uri=" + encode(CALLBACK_URI.toString())
-          + "&state=" + encode(state)
-          + "&scope=api"
-          + "&code_challenge=" + encode(pkce.challenge())
-          + "&code_challenge_method=S256");
+    private HttpUrl authorizationUrl(String state, Pkce pkce) {
+      return endpoint("services/oauth2/authorize")
+          .addQueryParameter("response_type", "code")
+          .addQueryParameter("client_id", clientId)
+          .addQueryParameter("redirect_uri", CALLBACK_URL.toString())
+          .addQueryParameter("state", state)
+          .addQueryParameter("scope", "api")
+          .addQueryParameter("code_challenge", pkce.challenge())
+          .addQueryParameter("code_challenge_method", "S256")
+          .build();
     }
 
-    String tokenEndpoint() {
-      return endpoint("/services/oauth2/token");
+    private HttpUrl tokenEndpoint() {
+      return endpoint("services/oauth2/token").build();
     }
 
-    String endpoint(String path) {
-      return domain + path;
+    private HttpUrl.Builder endpoint(String path) {
+      return domain.newBuilder().addPathSegments(path);
     }
   }
 
-  private record AuthorizationAttempt(String state, Pkce pkce, URI authorizationUri) {
+  private record AuthorizationAttempt(String state, Pkce pkce, HttpUrl authorizationUrl) {
 
-    static AuthorizationAttempt forApp(ConnectedApp connectedApp) {
-      var state = randomUrlSafe(32);
+    private static AuthorizationAttempt forApp(ConnectedApp connectedApp) {
+      var state = UUID.randomUUID().toString();
       var pkce = Pkce.create();
-      return new AuthorizationAttempt(state, pkce, connectedApp.authorizationUri(state, pkce));
+      return new AuthorizationAttempt(state, pkce, connectedApp.authorizationUrl(state, pkce));
     }
   }
 
   private record Pkce(String verifier, String challenge) {
 
-    static Pkce create() {
-      var verifier = randomUrlSafe(64);
+    private static Pkce create() {
+      var verifier = UUID.randomUUID() + "." + UUID.randomUUID();
       return new Pkce(verifier, sha256UrlSafe(verifier));
     }
   }
@@ -148,11 +144,11 @@ final class SalesforceOAuth {
       this.connectedApp = connectedApp;
     }
 
-    String exchange(String authorizationCode, Pkce pkce) {
+    private String exchange(String authorizationCode, Pkce pkce) {
       var tokenRequest = new FormBody.Builder()
           .add("grant_type", "authorization_code")
           .add("client_id", connectedApp.clientId())
-          .add("redirect_uri", CALLBACK_URI.toString())
+          .add("redirect_uri", CALLBACK_URL.toString())
           .add("code", required(authorizationCode, "authorizationCode"))
           .add("code_verifier", pkce.verifier())
           .build();
@@ -194,15 +190,15 @@ final class SalesforceOAuth {
 
       try {
         this.server = HttpServer.create(
-            new InetSocketAddress("localhost", CALLBACK_URI.getPort()), 0);
+            new InetSocketAddress(CALLBACK_URL.host(), CALLBACK_URL.port()), 0);
       } catch (IOException e) {
         throw new RuntimeException(e);
       }
-      this.server.createContext(CALLBACK_URI.getPath(), this::receive);
+      this.server.createContext(CALLBACK_URL.encodedPath(), this::receive);
       this.server.start();
     }
 
-    String awaitAuthorizationCode() {
+    private String awaitAuthorizationCode() {
       try {
         return authorizationCode.get();
       } catch (Exception failure) {
@@ -211,13 +207,16 @@ final class SalesforceOAuth {
     }
 
     private void receive(HttpExchange exchange) throws IOException {
-      var callbackParameters = query(exchange.getRequestURI().getRawQuery());
-      if (!constantTimeEquals(expectedState, callbackParameters.getOrDefault("state", ""))
-          || !callbackParameters.containsKey("code")) {
-        reject(exchange, callbackParameters);
+      var callbackUrl = CALLBACK_URL.newBuilder()
+          .encodedQuery(exchange.getRequestURI().getRawQuery())
+          .build();
+      var state = callbackUrl.queryParameter("state");
+      var code = callbackUrl.queryParameter("code");
+      if (!constantTimeEquals(expectedState, state == null ? "" : state) || code == null) {
+        reject(exchange, callbackUrl.queryParameter("error_description"));
         return;
       }
-      accept(exchange, callbackParameters.get("code"));
+      accept(exchange, code);
     }
 
     private void accept(HttpExchange exchange, String code) throws IOException {
@@ -228,14 +227,12 @@ final class SalesforceOAuth {
       }
     }
 
-    private void reject(HttpExchange exchange, Map<String, String> callbackParameters)
-        throws IOException {
+    private void reject(HttpExchange exchange, String errorDescription) throws IOException {
       try {
         reply(exchange, 400, "Salesforce authentication failed. You may close this window.");
       } finally {
         authorizationCode.completeExceptionally(new IOException(
-            callbackParameters.getOrDefault(
-                "error_description", "Invalid Salesforce OAuth callback")));
+            errorDescription == null ? "Invalid Salesforce OAuth callback" : errorDescription));
       }
     }
 
@@ -252,24 +249,6 @@ final class SalesforceOAuth {
     try (var response = exchange.getResponseBody()) {
       response.write(body);
     }
-  }
-
-  private static Map<String, String> query(String rawQuery) {
-    var values = new HashMap<String, String>();
-    if (rawQuery == null || rawQuery.isBlank()) {
-      return values;
-    }
-    for (var parameter : rawQuery.split("&")) {
-      var pair = parameter.split("=", 2);
-      values.put(decode(pair[0]), pair.length == 2 ? decode(pair[1]) : "");
-    }
-    return values;
-  }
-
-  private static String randomUrlSafe(int bytes) {
-    var value = new byte[bytes];
-    RANDOM.nextBytes(value);
-    return Base64.getUrlEncoder().withoutPadding().encodeToString(value);
   }
 
   private static String sha256UrlSafe(String value) {
@@ -295,11 +274,4 @@ final class SalesforceOAuth {
     return value.trim();
   }
 
-  private static String encode(String value) {
-    return URLEncoder.encode(value, StandardCharsets.UTF_8);
-  }
-
-  private static String decode(String value) {
-    return URLDecoder.decode(value, StandardCharsets.UTF_8);
-  }
 }
