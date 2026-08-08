@@ -54,12 +54,7 @@ public final class SalesforceOAuth {
 
   private static OkHttpClient authenticatedClient(
       ConnectedApp connectedApp, Consumer<URI> authorizationPage) {
-    var tokenGateway = new SalesforceTokenGateway(connectedApp);
-    Supplier<String> tokenProvider = () -> {
-      var attempt = AuthorizationAttempt.forApp(connectedApp);
-      var authorizationCode = authorize(attempt, authorizationPage);
-      return tokenGateway.exchange(authorizationCode, attempt.pkce());
-    };
+    Supplier<String> tokenProvider = new SalesforceTokenProvider(connectedApp, authorizationPage);
     return new OkHttpClient.Builder()
         .addInterceptor(new LazyAuthenticationInterceptor(connectedApp.domain(), tokenProvider))
         .build();
@@ -162,7 +157,7 @@ public final class SalesforceOAuth {
           .addQueryParameter("client_id", clientId)
           .addQueryParameter("redirect_uri", CALLBACK_URL.toString())
           .addQueryParameter("state", state)
-          .addQueryParameter("scope", "api")
+          .addQueryParameter("scope", "api refresh_token")
           .addQueryParameter("code_challenge", pkce.challenge())
           .addQueryParameter("code_challenge_method", "S256")
           .build();
@@ -194,6 +189,54 @@ public final class SalesforceOAuth {
     }
   }
 
+  private static final class SalesforceTokenProvider implements Supplier<String> {
+
+    private final ConnectedApp connectedApp;
+    private final Consumer<URI> authorizationPage;
+    private final SalesforceTokenGateway tokenGateway;
+    private String refreshToken;
+
+    private SalesforceTokenProvider(
+        ConnectedApp connectedApp, Consumer<URI> authorizationPage) {
+      this.connectedApp = connectedApp;
+      this.authorizationPage = authorizationPage;
+      this.tokenGateway = new SalesforceTokenGateway(connectedApp);
+    }
+
+    @Override
+    public String get() {
+      var tokens = refreshToken == null
+          ? authorize()
+          : refreshOrAuthorize();
+      if (refreshToken == null && tokens.refreshToken() == null) {
+        throw new SalesforceAuthenticationException(
+            "Salesforce token response has no refresh_token");
+      }
+      if (tokens.refreshToken() != null) {
+        refreshToken = tokens.refreshToken();
+      }
+      return tokens.accessToken();
+    }
+
+    private SalesforceTokens refreshOrAuthorize() {
+      try {
+        return tokenGateway.refresh(refreshToken);
+      } catch (SalesforceAuthenticationException refreshFailure) {
+        refreshToken = null;
+        return authorize();
+      }
+    }
+
+    private SalesforceTokens authorize() {
+      var attempt = AuthorizationAttempt.forApp(connectedApp);
+      var authorizationCode = SalesforceOAuth.authorize(attempt, authorizationPage);
+      return tokenGateway.exchange(authorizationCode, attempt.pkce());
+    }
+  }
+
+  private record SalesforceTokens(String accessToken, String refreshToken) {
+  }
+
   private static final class SalesforceTokenGateway {
 
     private final ConnectedApp connectedApp;
@@ -203,7 +246,7 @@ public final class SalesforceOAuth {
       this.connectedApp = connectedApp;
     }
 
-    private String exchange(String authorizationCode, Pkce pkce) {
+    private SalesforceTokens exchange(String authorizationCode, Pkce pkce) {
       if (authorizationCode == null || authorizationCode.isBlank()) {
         throw new SalesforceAuthenticationException(
             "Salesforce authorization callback returned no authorization code");
@@ -216,6 +259,19 @@ public final class SalesforceOAuth {
           .add("code", authorizationCode.trim())
           .add("code_verifier", pkce.verifier())
           .build();
+      return exchange(tokenRequest);
+    }
+
+    private SalesforceTokens refresh(String refreshToken) {
+      var tokenRequest = new FormBody.Builder()
+          .add("grant_type", "refresh_token")
+          .add("client_id", connectedApp.clientId())
+          .add("refresh_token", refreshToken)
+          .build();
+      return exchange(tokenRequest);
+    }
+
+    private SalesforceTokens exchange(FormBody tokenRequest) {
       var request = new Request.Builder()
           .url(connectedApp.tokenEndpoint())
           .post(tokenRequest)
@@ -237,10 +293,15 @@ public final class SalesforceOAuth {
           throw new SalesforceAuthenticationException(
               "Salesforce token response has a blank access_token");
         }
-        return accessToken.trim();
+        var refreshToken = responseBody.has("refresh_token")
+            ? responseBody.get("refresh_token").asString()
+            : null;
+        return new SalesforceTokens(
+            accessToken.trim(),
+            refreshToken == null || refreshToken.isBlank() ? null : refreshToken.trim());
       } catch (IOException e) {
         throw new SalesforceAuthenticationException(
-            "Could not exchange the Salesforce authorization code: " + e.getMessage());
+            "Could not request a Salesforce token: " + e.getMessage());
       }
     }
 

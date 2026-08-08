@@ -39,15 +39,21 @@ class SalesforceOauthWebApplicationTests {
     AtomicInteger tokenCount = new AtomicInteger();
     AtomicInteger requestCount = new AtomicInteger();
     List<String> authorizationHeaders = new ArrayList<>();
+    List<String> tokenRequests = new ArrayList<>();
     HttpServer fakeSalesforce = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
     fakeSalesforce.createContext("/services/oauth2/token", exchange -> {
       int tokenNumber = tokenCount.incrementAndGet();
-      respond(exchange, 200, "{\"access_token\":\"test-access-token-" + tokenNumber + "\"}");
+      tokenRequests.add(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+      var rotatedRefreshToken = tokenNumber < 3
+          ? ",\"refresh_token\":\"test-refresh-token-" + tokenNumber + "\""
+          : "";
+      respond(exchange, 200, "{\"access_token\":\"test-access-token-" + tokenNumber + "\""
+          + rotatedRefreshToken + "}");
     });
     fakeSalesforce.createContext("/services/data", exchange -> {
       authorizationHeaders.add(exchange.getRequestHeaders().getFirst("Authorization"));
       int requestNumber = requestCount.incrementAndGet();
-      respond(exchange, requestNumber == 2 ? 401 : 200, "ok");
+      respond(exchange, requestNumber == 2 || requestNumber == 4 ? 401 : 200, "ok");
     });
     fakeSalesforce.start();
 
@@ -57,6 +63,7 @@ class SalesforceOauthWebApplicationTests {
         authorizationCount.incrementAndGet();
         assertEquals("test-client-id", queryValue(authorizationUri, "client_id"));
         assertEquals("S256", queryValue(authorizationUri, "code_challenge_method"));
+        assertEquals("api refresh_token", queryValue(authorizationUri, "scope"));
         assertEquals("http://localhost:8999/oauth/callback", queryValue(authorizationUri, "redirect_uri"));
         String callback = "http://localhost:8999/oauth/callback?code=test-code&state="
             + queryValue(authorizationUri, "state");
@@ -75,13 +82,22 @@ class SalesforceOauthWebApplicationTests {
       try (Response response = client.newCall(new Request.Builder().url(domain + "/services/data").build()).execute()) {
         assertTrue(response.isSuccessful());
       }
+      try (Response response = client.newCall(new Request.Builder().url(domain + "/services/data").build()).execute()) {
+        assertTrue(response.isSuccessful());
+      }
 
-      assertEquals(2, authorizationCount.get());
-      assertEquals(2, tokenCount.get());
+      assertEquals(1, authorizationCount.get());
+      assertEquals(3, tokenCount.get());
       assertEquals(List.of(
           "Bearer test-access-token-1",
           "Bearer test-access-token-1",
-          "Bearer test-access-token-2"), authorizationHeaders);
+          "Bearer test-access-token-2",
+          "Bearer test-access-token-2",
+          "Bearer test-access-token-3"), authorizationHeaders);
+      assertTrue(tokenRequests.get(0).contains("grant_type=authorization_code"));
+      assertTrue(tokenRequests.get(1).contains("grant_type=refresh_token"));
+      assertTrue(tokenRequests.get(1).contains("refresh_token=test-refresh-token-1"));
+      assertTrue(tokenRequests.get(2).contains("refresh_token=test-refresh-token-2"));
     } finally {
       fakeSalesforce.stop(0);
     }
@@ -93,7 +109,8 @@ class SalesforceOauthWebApplicationTests {
     AtomicReference<String> foreignAuthorizationHeader = new AtomicReference<>();
     HttpServer fakeSalesforce = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
     fakeSalesforce.createContext("/services/oauth2/token", exchange ->
-        respond(exchange, 200, "{\"access_token\":\"test-access-token\"}"));
+        respond(exchange, 200,
+            "{\"access_token\":\"test-access-token\",\"refresh_token\":\"test-refresh-token\"}"));
     fakeSalesforce.createContext("/services/data", exchange -> respond(
         exchange,
         exchange.getRequestHeaders().getFirst("Authorization") == null ? 401 : 200,
@@ -143,7 +160,8 @@ class SalesforceOauthWebApplicationTests {
     HttpServer fakeSalesforce = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
     fakeSalesforce.createContext("/services/oauth2/token", exchange -> {
       tokenCount.incrementAndGet();
-      respond(exchange, 200, "{\"access_token\":\"test-access-token\"}");
+      respond(exchange, 200,
+          "{\"access_token\":\"test-access-token\",\"refresh_token\":\"test-refresh-token\"}");
     });
     fakeSalesforce.createContext("/services/data", exchange -> {
       respond(
@@ -211,6 +229,55 @@ class SalesforceOauthWebApplicationTests {
           "Salesforce token exchange failed: "
               + "{\"error\":\"invalid_grant\",\"error_description\":\"Authorization code expired\"}",
           failure.getMessage());
+    } finally {
+      fakeSalesforce.stop(0);
+    }
+  }
+
+  @Test
+  void reauthorizesWhenTheRefreshTokenIsRejected() throws Exception {
+    AtomicInteger authorizationCount = new AtomicInteger();
+    AtomicInteger tokenRequestCount = new AtomicInteger();
+    AtomicInteger businessRequestCount = new AtomicInteger();
+    List<String> tokenRequests = new ArrayList<>();
+    HttpServer fakeSalesforce = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
+    fakeSalesforce.createContext("/services/oauth2/token", exchange -> {
+      int requestNumber = tokenRequestCount.incrementAndGet();
+      tokenRequests.add(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+      if (requestNumber == 2) {
+        respond(exchange, 400, "{\"error\":\"invalid_grant\"}");
+        return;
+      }
+      respond(exchange, 200, "{\"access_token\":\"test-access-token-" + requestNumber
+          + "\",\"refresh_token\":\"test-refresh-token-" + requestNumber + "\"}");
+    });
+    fakeSalesforce.createContext("/services/data", exchange -> {
+      int requestNumber = businessRequestCount.incrementAndGet();
+      respond(exchange, requestNumber == 2 ? 401 : 200, "ok");
+    });
+    fakeSalesforce.start();
+
+    try {
+      String domain = "http://localhost:" + fakeSalesforce.getAddress().getPort();
+      OkHttpClient client = SalesforceOAuth.authenticate("test-client-id", domain, authorizationUri -> {
+        authorizationCount.incrementAndGet();
+        completeAuthorization(authorizationUri);
+      });
+
+      try (Response response = client.newCall(
+          new Request.Builder().url(domain + "/services/data").build()).execute()) {
+        assertTrue(response.isSuccessful());
+      }
+      try (Response response = client.newCall(
+          new Request.Builder().url(domain + "/services/data").build()).execute()) {
+        assertTrue(response.isSuccessful());
+      }
+
+      assertEquals(2, authorizationCount.get());
+      assertEquals(3, tokenRequestCount.get());
+      assertTrue(tokenRequests.get(0).contains("grant_type=authorization_code"));
+      assertTrue(tokenRequests.get(1).contains("grant_type=refresh_token"));
+      assertTrue(tokenRequests.get(2).contains("grant_type=authorization_code"));
     } finally {
       fakeSalesforce.stop(0);
     }
