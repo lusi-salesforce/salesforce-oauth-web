@@ -3,7 +3,6 @@ package pl.lusicloud.salesforceoauthweb;
 import static java.util.Objects.requireNonNull;
 
 import java.io.IOException;
-import java.util.Objects;
 
 import okhttp3.HttpUrl;
 import okhttp3.OkHttpClient;
