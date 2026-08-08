@@ -10,13 +10,16 @@ import java.security.NoSuchAlgorithmException;
 import java.util.Base64;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
 import okhttp3.FormBody;
 import okhttp3.HttpUrl;
+import okhttp3.Interceptor;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
@@ -26,6 +29,7 @@ import tools.jackson.databind.ObjectMapper;
 public final class SalesforceOAuth {
 
   private static final HttpUrl CALLBACK_URL = HttpUrl.get("http://localhost:8999/oauth/callback");
+  private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
   private SalesforceOAuth() {
   }
@@ -37,11 +41,7 @@ public final class SalesforceOAuth {
   static OkHttpClient authenticate(
       String clientId, String salesforceDomain, Consumer<URI> authorizationPage) {
     var connectedApp = ConnectedApp.from(clientId, salesforceDomain);
-    var attempt = AuthorizationAttempt.forApp(connectedApp);
-    var authorizationCode = authorize(attempt, authorizationPage);
-    var accessToken = new SalesforceTokenGateway(connectedApp)
-        .exchange(authorizationCode, attempt.pkce());
-    return authenticatedClient(accessToken);
+    return authenticatedClient(connectedApp, authorizationPage);
   }
 
   private static String authorize(
@@ -52,12 +52,72 @@ public final class SalesforceOAuth {
     }
   }
 
-  private static OkHttpClient authenticatedClient(String accessToken) {
+  private static OkHttpClient authenticatedClient(
+      ConnectedApp connectedApp, Consumer<URI> authorizationPage) {
+    var tokenGateway = new SalesforceTokenGateway(connectedApp);
+    Supplier<String> tokenProvider = () -> {
+      var attempt = AuthorizationAttempt.forApp(connectedApp);
+      var authorizationCode = authorize(attempt, authorizationPage);
+      return tokenGateway.exchange(authorizationCode, attempt.pkce());
+    };
     return new OkHttpClient.Builder()
-        .addInterceptor(chain -> chain.proceed(chain.request().newBuilder()
-            .header("Authorization", "Bearer " + accessToken)
-            .build()))
+        .addInterceptor(new LazyAuthenticationInterceptor(connectedApp.domain(), tokenProvider))
         .build();
+  }
+
+  private static final class LazyAuthenticationInterceptor implements Interceptor {
+
+    private final HttpUrl salesforceOrigin;
+    private final Supplier<String> tokenProvider;
+    private volatile TokenState tokenState = new TokenState(null);
+
+    private LazyAuthenticationInterceptor(
+        HttpUrl salesforceOrigin, Supplier<String> tokenProvider) {
+      this.salesforceOrigin = salesforceOrigin;
+      this.tokenProvider = tokenProvider;
+    }
+
+    @Override
+    public Response intercept(Chain chain) throws IOException {
+      var request = chain.request();
+      if (!sameOrigin(request.url(), salesforceOrigin)) {
+        return chain.proceed(request);
+      }
+
+      var requestToken = tokenState;
+      if (requestToken.value() == null) {
+        requestToken = reauthenticate(requestToken);
+      }
+
+      var response = chain.proceed(withAccessToken(request, requestToken.value()));
+      if (response.code() == 401) {
+        response.close();
+        var newToken = reauthenticate(requestToken);
+        return chain.proceed(withAccessToken(request, newToken.value()));
+      }
+
+      return response;
+    }
+
+    private synchronized TokenState reauthenticate(TokenState rejectedToken) {
+      // A different request already replaced the snapshot that received the 401.
+      if (tokenState != rejectedToken) {
+        return tokenState;
+      }
+
+      tokenState = new TokenState(tokenProvider.get());
+      return tokenState;
+    }
+
+    private Request withAccessToken(Request request, String token) {
+      return request.newBuilder()
+          .header("Authorization", "Bearer " + token)
+          .build();
+    }
+
+    // Identity tracks refreshes even when Salesforce reissues the same token value after authenticating again
+    private record TokenState(String value) {
+    }
   }
 
   private static void openBrowser(URI authorizationUri) {
@@ -138,18 +198,22 @@ public final class SalesforceOAuth {
 
     private final ConnectedApp connectedApp;
     private final OkHttpClient httpClient = new OkHttpClient();
-    private final ObjectMapper objectMapper = new ObjectMapper();
 
     private SalesforceTokenGateway(ConnectedApp connectedApp) {
       this.connectedApp = connectedApp;
     }
 
     private String exchange(String authorizationCode, Pkce pkce) {
+      if (authorizationCode == null || authorizationCode.isBlank()) {
+        throw new SalesforceAuthenticationException(
+            "Salesforce authorization callback returned no authorization code");
+      }
+
       var tokenRequest = new FormBody.Builder()
           .add("grant_type", "authorization_code")
           .add("client_id", connectedApp.clientId())
           .add("redirect_uri", CALLBACK_URL.toString())
-          .add("code", required(authorizationCode, "authorizationCode"))
+          .add("code", authorizationCode.trim())
           .add("code_verifier", pkce.verifier())
           .build();
       var request = new Request.Builder()
@@ -158,31 +222,48 @@ public final class SalesforceOAuth {
           .build();
 
       try (var response = httpClient.newCall(request).execute()) {
-        var responseBody = objectMapper.readTree(response.body().string());
+        var responseContent = response.body().string();
         if (!response.isSuccessful()) {
-          throw tokenExchangeFailure(response, responseBody);
+          throw new SalesforceAuthenticationException(
+              "Salesforce token exchange failed: " + responseContent);
         }
+        var responseBody = readTokenResponse(responseContent);
         if (!responseBody.has("access_token")) {
-          throw new IOException("Salesforce token response has no access_token");
+          throw new SalesforceAuthenticationException(
+              "Salesforce token response has no access_token");
         }
-        return required(responseBody.get("access_token").asString(), "accessToken");
+        var accessToken = responseBody.get("access_token").asString();
+        if (accessToken == null || accessToken.isBlank()) {
+          throw new SalesforceAuthenticationException(
+              "Salesforce token response has a blank access_token");
+        }
+        return accessToken.trim();
       } catch (IOException e) {
-        throw new RuntimeException(e);
+        throw new SalesforceAuthenticationException(
+            "Could not exchange the Salesforce authorization code: " + e.getMessage());
       }
     }
 
-    private IOException tokenExchangeFailure(Response response, JsonNode responseBody) {
-      var reason = responseBody.has("error_description")
-          ? responseBody.get("error_description").asString()
-          : Integer.toString(response.code());
-      return new IOException("Salesforce token exchange failed: " + reason);
+    private JsonNode readTokenResponse(String responseContent) {
+      JsonNode responseBody;
+      try {
+        responseBody = OBJECT_MAPPER.readTree(responseContent);
+      } catch (RuntimeException parsingFailure) {
+        throw new SalesforceAuthenticationException(
+            "Salesforce token response is not valid JSON");
+      }
+      if (responseBody == null) {
+        throw new SalesforceAuthenticationException(
+            "Salesforce token response is empty");
+      }
+      return responseBody;
     }
   }
 
   private static final class LoopbackCallbackServer implements AutoCloseable {
 
     private final String expectedState;
-    private final CompletableFuture<String> authorizationCode = new CompletableFuture<>();
+    private final CompletableFuture<String> authorizationCodeFuture = new CompletableFuture<>();
     private final HttpServer server;
 
     private LoopbackCallbackServer(String expectedState) {
@@ -190,49 +271,72 @@ public final class SalesforceOAuth {
 
       try {
         this.server = HttpServer.create(
-            new InetSocketAddress(CALLBACK_URL.host(), CALLBACK_URL.port()), 0);
+            new InetSocketAddress(CALLBACK_URL.host(), CALLBACK_URL.port()),
+            0,
+            CALLBACK_URL.encodedPath(),
+            this::handleSalesforceCallback);
       } catch (IOException e) {
-        throw new RuntimeException(e);
+        throw new SalesforceAuthenticationException(
+            "Could not start the Salesforce OAuth callback server: " + e.getMessage());
       }
-      this.server.createContext(CALLBACK_URL.encodedPath(), this::receive);
       this.server.start();
     }
 
     private String awaitAuthorizationCode() {
       try {
-        return authorizationCode.get();
-      } catch (Exception failure) {
-        throw new RuntimeException("Salesforce authorization failed", failure.getCause());
+        return authorizationCodeFuture.get();
+      } catch (InterruptedException failure) {
+        Thread.currentThread().interrupt();
+        throw new SalesforceAuthenticationException(
+            "Salesforce authorization was interrupted");
+      } catch (ExecutionException failure) {
+        if (failure.getCause() instanceof SalesforceAuthenticationException authenticationFailure) {
+          throw authenticationFailure;
+        }
+        throw new SalesforceAuthenticationException(
+            "Salesforce authorization callback failed");
       }
     }
 
-    private void receive(HttpExchange exchange) throws IOException {
+    private void handleSalesforceCallback(HttpExchange exchange) throws IOException {
       var callbackUrl = CALLBACK_URL.newBuilder()
           .encodedQuery(exchange.getRequestURI().getRawQuery())
           .build();
       var state = callbackUrl.queryParameter("state");
       var code = callbackUrl.queryParameter("code");
-      if (!constantTimeEquals(expectedState, state == null ? "" : state) || code == null) {
-        reject(exchange, callbackUrl.queryParameter("error_description"));
+      if (!constantTimeEquals(expectedState, state == null ? "" : state)) {
+        showPageError(exchange, new SalesforceAuthenticationException(
+            "Salesforce OAuth callback has an invalid state"));
         return;
       }
-      accept(exchange, code);
+      if (code == null || code.isBlank()) {
+        var oauthError = callbackUrl.queryParameter("error");
+        var description = callbackUrl.queryParameter("error_description");
+        showPageError(exchange, new SalesforceAuthenticationException(
+            description == null
+                ? "Salesforce authorization was rejected"
+                : "Salesforce authorization was rejected"
+                    + (oauthError == null ? "" : " (" + oauthError + ")")
+                    + ": " + description));
+        return;
+      }
+      showPageSuccess(exchange, code);
     }
 
-    private void accept(HttpExchange exchange, String code) throws IOException {
+    private void showPageSuccess(HttpExchange exchange, String code) throws IOException {
       try {
         reply(exchange, 200, "Salesforce authentication complete. You may close this window.");
       } finally {
-        authorizationCode.complete(code);
+        authorizationCodeFuture.complete(code);
       }
     }
 
-    private void reject(HttpExchange exchange, String errorDescription) throws IOException {
+    private void showPageError(
+        HttpExchange exchange, SalesforceAuthenticationException failure) throws IOException {
       try {
         reply(exchange, 400, "Salesforce authentication failed. You may close this window.");
       } finally {
-        authorizationCode.completeExceptionally(new IOException(
-            errorDescription == null ? "Invalid Salesforce OAuth callback" : errorDescription));
+        authorizationCodeFuture.completeExceptionally(failure);
       }
     }
 
@@ -265,6 +369,12 @@ public final class SalesforceOAuth {
     return MessageDigest.isEqual(
         expected.getBytes(StandardCharsets.UTF_8),
         actual.getBytes(StandardCharsets.UTF_8));
+  }
+
+  private static boolean sameOrigin(HttpUrl first, HttpUrl second) {
+    return first.scheme().equals(second.scheme())
+        && first.host().equals(second.host())
+        && first.port() == second.port();
   }
 
   private static String required(String value, String name) {
